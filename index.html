@@ -1,0 +1,1323 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Звёздный сад — процедурный космос на WebGPU</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #e8ecf6; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; outline: none; }
+  #menu { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: radial-gradient(ellipse at center, rgba(5,8,20,0.35), rgba(0,0,0,0.75)); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); transition: opacity .4s; z-index: 5; }
+  #menu.hidden { opacity: 0; pointer-events: none; }
+  .card { max-width: 440px; padding: 34px 38px; border-radius: 18px; background: rgba(10,14,30,0.6); border: 1px solid rgba(160,180,255,0.15); box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+  h1 { margin: 0 0 4px; font-weight: 300; letter-spacing: .08em; font-size: 30px; }
+  .sub { margin: 0 0 22px; opacity: .65; font-size: 14px; line-height: 1.5; }
+  button { font: inherit; cursor: pointer; border: none; }
+  #go { width: 100%; padding: 13px; border-radius: 12px; font-size: 17px; letter-spacing: .05em; color: #0a0d18; background: linear-gradient(90deg, #ffd9a0, #ffb36b); }
+  #go:hover { filter: brightness(1.08); }
+  #go:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; margin: 18px 0 6px; align-items: center; font-size: 13px; }
+  .row span { opacity: .6; margin-right: 4px; }
+  .q { padding: 6px 12px; border-radius: 8px; background: rgba(255,255,255,0.07); color: #cfd6ea; font-size: 13px; }
+  .q.on { background: rgba(255,200,140,0.25); color: #fff; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 14px; }
+  td { padding: 3px 0; opacity: .8; }
+  td:first-child { opacity: .5; width: 48%; }
+  kbd { font-family: inherit; background: rgba(255,255,255,0.1); border-radius: 4px; padding: 1px 6px; }
+  #stats { position: fixed; top: 10px; left: 12px; font: 12px/1.5 ui-monospace, Consolas, monospace; background: rgba(0,0,0,0.45); padding: 6px 10px; border-radius: 8px; display: none; z-index: 4; white-space: pre; }
+  #hint { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); font-size: 12px; opacity: .45; z-index: 4; pointer-events: none; transition: opacity 1s; }
+  #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; text-align: center; padding: 30px; z-index: 10; background: #05060c; line-height: 1.6; }
+  #err pre { text-align: left; font-size: 11px; opacity: .7; max-width: 90vw; overflow: auto; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0"></canvas>
+
+<div id="menu">
+  <div class="card">
+    <h1>Звёздный сад</h1>
+    <p class="sub">Солнце, газовый гигант с кольцами, планета с океанами и облаками, луна, станция и пояс астероидов. Всё рисуется кодом на WebGPU: никаких картинок, моделей и звуковых файлов.</p>
+    <button id="go" disabled>Собираю систему…</button>
+    <div class="row"><span>Детализация:</span>
+      <button class="q" data-q="low">Низкая</button>
+      <button class="q" data-q="medium">Средняя</button>
+      <button class="q" data-q="high">Высокая</button>
+    </div>
+    <table>
+      <tr><td>Осмотреться</td><td>мышь</td></tr>
+      <tr><td>Лететь</td><td><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd></td></tr>
+      <tr><td>Вверх / вниз</td><td><kbd>E</kbd> / <kbd>Q</kbd></td></tr>
+      <tr><td>Ускорение (растёт, пока держишь)</td><td><kbd>Shift</kbd></td></tr>
+      <tr><td>Точки обзора</td><td><kbd>1</kbd> … <kbd>6</kbd></td></tr>
+      <tr><td>Звук</td><td><kbd>M</kbd></td></tr>
+      <tr><td>Статистика</td><td><kbd>H</kbd></td></tr>
+      <tr><td>Меню</td><td><kbd>Esc</kbd></td></tr>
+    </table>
+  </div>
+</div>
+<div id="stats"></div>
+<div id="hint">Esc — меню · 1–6 — точки обзора · Shift — ускорение</div>
+<div id="err"></div>
+
+<script>
+"use strict";
+// =====================================================================
+//  Звёздный сад: процедурная звёздная система на чистом WebGPU.
+//  Без движков, текстур, моделей и звуковых файлов.
+// =====================================================================
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("c");
+
+function fail(msg, detail) {
+  const e = $("err");
+  e.style.display = "flex";
+  e.innerHTML = "<div><h2 style='font-weight:300'>" + msg + "</h2>" +
+    (detail ? "<pre>" + String(detail).replace(/</g, "&lt;") + "</pre>" : "") + "</div>";
+}
+
+// ---------------------------------------------------------------------
+//  Детализация
+// ---------------------------------------------------------------------
+const QUALITY = {
+  low:    { scale: 0.6,  msaa: 1, ast: 6000,  dust: 1500, sphere: [96, 48] },
+  medium: { scale: 0.85, msaa: 4, ast: 14000, dust: 3000, sphere: [128, 64] },
+  high:   { scale: 1.0,  msaa: 4, ast: 28000, dust: 5000, sphere: [192, 96] },
+};
+let qName = "high";
+const urlQ = /[?&]q=(low|medium|high)/.exec(location.search);
+try {
+  const saved = localStorage.getItem("stellar-quality");
+  if (urlQ) qName = urlQ[1];
+  else if (saved && QUALITY[saved]) qName = saved;
+  else if ((navigator.deviceMemory && navigator.deviceMemory <= 4) || /Android|iPhone|iPad/.test(navigator.userAgent)) qName = "medium";
+} catch (e) {}
+const Q = QUALITY[qName];
+
+// ---------------------------------------------------------------------
+//  Детерминированный генератор случайных чисел и шум на JS
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry32(20261118);
+const gauss = () => { let u = 0, v = 0; while (u === 0) u = rnd(); v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(6.2831853 * v); };
+
+function jhash(x, y, z) { const h = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453; return h - Math.floor(h); }
+function jnoise(x, y, z) {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy), uz = fz * fz * (3 - 2 * fz);
+  const l = (a, b, t) => a + (b - a) * t;
+  return l(
+    l(l(jhash(ix, iy, iz), jhash(ix + 1, iy, iz), ux), l(jhash(ix, iy + 1, iz), jhash(ix + 1, iy + 1, iz), ux), uy),
+    l(l(jhash(ix, iy, iz + 1), jhash(ix + 1, iy, iz + 1), ux), l(jhash(ix, iy + 1, iz + 1), jhash(ix + 1, iy + 1, iz + 1), ux), uy), uz);
+}
+
+// ---------------------------------------------------------------------
+//  Векторная математика (без аллокаций в кадре: только в подготовке)
+// ---------------------------------------------------------------------
+const v3 = (x, y, z) => [x, y, z];
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const mul = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const len = (a) => Math.hypot(a[0], a[1], a[2]);
+const norm = (a) => { const l = len(a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+
+// ---------------------------------------------------------------------
+//  Устройство звёздной системы
+// ---------------------------------------------------------------------
+const SUN_R = 260;
+const GIANT = v3(2300, 140, -1400), GIANT_R = 230;
+const EARTH = v3(-1500, -120, 1700), EARTH_R = 95;
+const MOON = add(EARTH, v3(250, 70, -150)), MOON_R = 26;
+
+// Плоскость колец и пояса астероидов газового гиганта (наклонена)
+const SYS = (() => {
+  const tilt = 0.42, yaw = 0.65;
+  const ct = Math.cos(tilt), st = Math.sin(tilt), cy = Math.cos(yaw), sy = Math.sin(yaw);
+  // поворот вокруг X на tilt, потом вокруг Y на yaw
+  const rx = (v) => [v[0], ct * v[1] - st * v[2], st * v[1] + ct * v[2]];
+  const ry = (v) => [cy * v[0] + sy * v[2], v[1], -sy * v[0] + cy * v[2]];
+  return { x: ry(rx([1, 0, 0])), y: ry(rx([0, 1, 0])), z: ry(rx([0, 0, 1])) };
+})();
+const sysToWorld = (l) => add(GIANT, add(add(mul(SYS.x, l[0]), mul(SYS.y, l[1])), mul(SYS.z, l[2])));
+
+// Станция: на дневной стороне планеты
+const toSunFromEarth = norm(mul(EARTH, -1));
+const STATION = add(EARTH, mul(norm(add(toSunFromEarth, v3(-0.5, 0.45, 0.6))), 150));
+const STATION_SCALE = 1.0;
+
+// ---------------------------------------------------------------------
+//  WGSL: общий код
+// ---------------------------------------------------------------------
+const COMMON = /* wgsl */`
+struct Frame {
+  vp: mat4x4f,
+  cam: vec4f,     // позиция камеры, w = время
+  fwd: vec4f,     // вперёд, w = tan(fov/2)
+  right: vec4f,   // вправо, w = соотношение сторон
+  up: vec4f,      // вверх, w = угловой размер пикселя
+  sx: vec4f, sy: vec4f, sz: vec4f, // оси системы гиганта
+  giant: vec4f,   // центр, радиус
+  vel: vec4f,     // скорость камеры, w = модуль
+};
+@group(0) @binding(0) var<uniform> F: Frame;
+
+const SUN_R: f32 = ${SUN_R.toFixed(1)};
+
+fn hash13(p: vec3f) -> f32 {
+  var q = fract(p * 0.1031);
+  q += dot(q, q.zyx + 31.32);
+  return fract((q.x + q.y) * q.z);
+}
+fn hash33(p: vec3f) -> vec3f {
+  var q = fract(p * vec3f(0.1031, 0.1030, 0.0973));
+  q += dot(q, q.yxz + 33.33);
+  return fract((q.xxy + q.yxx) * q.zyx);
+}
+fn vnoise(p: vec3f) -> f32 {
+  let i = floor(p); let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash13(i);                       let b = hash13(i + vec3f(1.0, 0.0, 0.0));
+  let c = hash13(i + vec3f(0.0, 1.0, 0.0)); let d = hash13(i + vec3f(1.0, 1.0, 0.0));
+  let e = hash13(i + vec3f(0.0, 0.0, 1.0)); let g = hash13(i + vec3f(1.0, 0.0, 1.0));
+  let h = hash13(i + vec3f(0.0, 1.0, 1.0)); let k = hash13(i + vec3f(1.0, 1.0, 1.0));
+  return mix(mix(mix(a, b, u.x), mix(c, d, u.x), u.y), mix(mix(e, g, u.x), mix(h, k, u.x), u.y), u.z);
+}
+fn fbm(p: vec3f, oct: i32) -> f32 {
+  var s = 0.0; var a = 0.5; var q = p;
+  for (var i = 0; i < oct; i++) {
+    s += a * vnoise(q);
+    q = q * 2.03 + vec3f(1.7, 9.2, 3.1);
+    a *= 0.5;
+  }
+  return s / (1.0 - pow(0.5, f32(oct)));
+}
+// Мягкая тень газового гиганта для точки p при направлении на солнце L
+fn giantShadow(p: vec3f, L: vec3f) -> f32 {
+  let oc = F.giant.xyz - p;
+  let t = dot(oc, L);
+  if (t < 0.0) { return 1.0; }
+  let d = length(oc - L * t);
+  return smoothstep(F.giant.w * 0.97, F.giant.w * 1.03, d);
+}
+// Плотность колец по радиусу (в радиусах планеты); fw гасит мелкие полосы вдали
+fn ringDens(r: f32, fw: f32) -> f32 {
+  if (r < 1.24 || r > 2.36) { return 0.0; }
+  let k1 = 1.0 - smoothstep(0.004, 0.02, fw);
+  let k2 = 1.0 - smoothstep(0.0015, 0.008, fw);
+  var d = 0.78 + 0.12 * sin(r * 41.0) + 0.12 * sin(r * 97.0 + 1.3) * k1 + 0.09 * sin(r * 263.0 + 0.5) * k2;
+  d *= 0.7 + 0.45 * vnoise(vec3f(r * 30.0, 0.5, 0.5));
+  d *= smoothstep(1.24, 1.34, r) * (1.0 - smoothstep(2.22, 2.36, r));
+  d *= 1.0 - 0.93 * (smoothstep(1.90, 1.93, r) - smoothstep(1.98, 2.01, r));  // щель Кассини
+  d *= 1.0 - 0.6 * (smoothstep(2.12, 2.13, r) - smoothstep(2.15, 2.16, r));
+  d = mix(d * 0.3, d, smoothstep(1.45, 1.6, r));                             // бледное внутреннее кольцо
+  return clamp(d, 0.0, 1.0);
+}
+// Возмущение нормали по экранным производным высоты (surface gradient)
+fn perturb(n: vec3f, dpx: vec3f, dpy: vec3f, dhx: f32, dhy: f32) -> vec3f {
+  let r1 = cross(dpy, n); let r2 = cross(n, dpx);
+  let det = dot(dpx, r1);
+  if (abs(det) < 1e-12) { return n; }
+  let g = sign(det) * (dhx * r1 + dhy * r2);
+  let m = abs(det) * n - g;
+  let l = length(m);
+  if (l < 1e-12) { return n; }
+  return m / l;
+}
+`;
+
+// ---------------------------------------------------------------------
+//  WGSL: небо (звёзды, туманности, Млечный Путь)
+// ---------------------------------------------------------------------
+const SKY_WGSL = COMMON + /* wgsl */`
+struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  var o: VO; o.pos = vec4f(p[i], 0.0, 1.0); o.ndc = p[i]; return o;
+}
+fn starLayer(d: vec3f, sc: f32, dens: f32, px: f32, seed: f32) -> vec3f {
+  let p = d * sc;
+  let c = floor(p);
+  let h = hash33(c + seed);
+  if (h.x > dens) { return vec3f(0.0); }
+  let sp = normalize(c + 0.2 + 0.6 * hash33(c + seed + 5.7)) * sc;
+  let q = sp - c;
+  if (any(q < vec3f(0.08)) || any(q > vec3f(0.92))) { return vec3f(0.0); }
+  let dist = length(p - sp);
+  let r = max(px * sc, 1e-5) * 0.8;
+  let b = exp(-dist * dist / (r * r));
+  let mag = 0.1 + pow(h.y, 10.0) * 5.0;
+  let col = mix(vec3f(1.0, 0.66, 0.42), vec3f(0.66, 0.77, 1.0), smoothstep(0.15, 0.85, h.z));
+  let halo = mag * 0.025 * r * r / (dist * dist + r * r);
+  return mix(col, vec3f(1.0), 0.35) * (b * mag + halo);
+}
+fn sky(d: vec3f) -> vec3f {
+  let gn = normalize(vec3f(0.3, 0.85, -0.42));
+  let g = dot(d, gn);
+  let band = exp(-g * g * 16.0);
+  let core = pow(max(dot(d, normalize(vec3f(-0.75, 0.3, -0.6))), 0.0), 5.0);
+  let n1 = fbm(d * 2.1 + vec3f(3.1, 1.7, 0.3), 5);
+  let n2 = fbm(d * 4.3 + vec3f(n1 * 1.6), 5);
+  let m1 = smoothstep(0.45, 0.78, n1);
+  var neb = vec3f(0.26, 0.07, 0.38) * m1 * 0.45;
+  neb += vec3f(0.04, 0.24, 0.36) * smoothstep(0.5, 0.82, n2) * m1 * 0.55;
+  neb += vec3f(0.6, 0.2, 0.08) * pow(smoothstep(0.42, 0.75, n2 * n1 * 1.45), 2.0) * 0.35;
+  let dust = smoothstep(0.38, 0.68, fbm(d * 7.0 + 11.0, 4));
+  let mwTex = 0.3 + 0.7 * fbm(d * 13.0, 4);
+  let mw = vec3f(0.55, 0.5, 0.46) * band * (0.07 + 0.3 * core) * mwTex * (1.0 - 0.8 * dust * band);
+  var col = neb * 0.5 + mw;
+  let px = F.up.w;
+  col += starLayer(d, 45.0, 0.08, px, 0.0);
+  col += starLayer(d, 120.0, 0.045, px, 11.0) * 0.5;
+  col += starLayer(d, 280.0, 0.01 + 0.35 * band * (0.4 + core), px, 23.0) * 0.3;
+  return col;
+}
+@fragment fn fs(in: VO) -> @location(0) vec4f {
+  let th = F.fwd.w; let asp = F.right.w;
+  let d = normalize(F.fwd.xyz + F.right.xyz * (in.ndc.x * th * asp) + F.up.xyz * (in.ndc.y * th));
+  return vec4f(sky(d), 1.0);
+}
+`;
+
+// ---------------------------------------------------------------------
+//  WGSL: солнце и планеты (отдельная точка входа на каждый тип)
+// ---------------------------------------------------------------------
+const PLANET_WGSL = COMMON + /* wgsl */`
+struct Planet { pos: vec4f, p: vec4f };  // центр+радиус; скорость вращения, наклон оси, зерно
+@group(0) @binding(1) var<storage, read> P: array<Planet>;
+struct PV { @builtin(position) pos: vec4f, @location(0) w: vec3f, @location(1) n: vec3f, @location(2) @interpolate(flat) id: u32 };
+
+@vertex fn vs(@location(0) v: vec3f, @builtin(instance_index) id: u32) -> PV {
+  let pl = P[id];
+  let w = pl.pos.xyz + v * pl.pos.w;
+  var o: PV; o.pos = F.vp * vec4f(w, 1.0); o.w = w; o.n = v; o.id = id; return o;
+}
+fn spinY(q: vec3f, a: f32) -> vec3f {
+  let c = cos(a); let s = sin(a);
+  return vec3f(c * q.x - s * q.z, q.y, s * q.x + c * q.z);
+}
+fn toLocal(n: vec3f, pl: Planet) -> vec3f {
+  let ct = cos(pl.p.y); let st = sin(pl.p.y);
+  let q = vec3f(n.x, ct * n.y + st * n.z, -st * n.y + ct * n.z);
+  return spinY(q, F.cam.w * pl.p.x);
+}
+
+// ---------- Солнце ----------
+@fragment fn fs_sun(in: PV) -> @location(0) vec4f {
+  let pl = P[in.id];
+  let n = normalize(in.n);
+  let V = normalize(F.cam.xyz - in.w);
+  let q = toLocal(n, pl);
+  let t = F.cam.w;
+  let g1 = fbm(q * 4.0 + vec3f(0.0, t * 0.015, 0.0), 5);
+  let g2 = fbm(q * 24.0 + vec3f(g1 * 2.5, -t * 0.04, 0.0), 4);
+  let gran = g1 * 0.55 + g2 * 0.55;
+  let mu = max(dot(n, V), 0.0);
+  let limb = 0.3 + 0.7 * pow(mu, 0.5);
+  let col = mix(vec3f(1.0, 0.38, 0.1), vec3f(1.0, 0.85, 0.6), smoothstep(0.35, 0.9, gran)) * (2.2 + 5.0 * gran * gran) * limb;
+  return vec4f(col, 1.0);
+}
+
+// ---------- Газовый гигант ----------
+@fragment fn fs_giant(in: PV) -> @location(0) vec4f {
+  let pl = P[in.id];
+  let n = normalize(in.n);
+  let L = normalize(-in.w);
+  let V = normalize(F.cam.xyz - in.w);
+  let t = F.cam.w;
+  var q = vec3f(dot(n, F.sx.xyz), dot(n, F.sy.xyz), dot(n, F.sz.xyz));
+  q = spinY(q, t * pl.p.x);
+  let sc = normalize(vec3f(0.8, -0.3, 0.52));
+  let sd = (q - sc) * vec3f(1.0, 2.3, 1.0);
+  let sdl = length(sd);
+  let storm = exp(-sdl * sdl * 30.0);
+  let w1 = fbm(q * vec3f(2.5, 8.0, 2.5) + vec3f(0.0, 0.0, t * 0.008), 5);
+  let w2 = fbm(q * vec3f(7.0, 30.0, 7.0) + vec3f(w1 * 2.2), 4);
+  let v = q.y * 7.0 + (w1 - 0.5) * 1.5 + (w2 - 0.5) * 0.4 + storm * sin(sdl * 38.0 - t * 0.2) * 0.7;
+  let b1 = 0.5 + 0.5 * sin(v * 3.1);
+  let b2 = 0.5 + 0.5 * sin(v * 7.7 + 1.7);
+  var alb = mix(vec3f(0.74, 0.56, 0.38), vec3f(0.45, 0.22, 0.1), b1);
+  alb = mix(alb, vec3f(0.86, 0.78, 0.64), b2 * 0.3);
+  alb = mix(alb, vec3f(0.33, 0.24, 0.20), smoothstep(0.72, 1.0, abs(q.y)) * 0.6);
+  alb = mix(alb, vec3f(0.78, 0.32, 0.16), storm * 0.85);
+  let ndl = dot(n, L);
+  let lit = pow(clamp((ndl + 0.08) / 1.08, 0.0, 1.0), 0.9);
+  // тень колец на планете
+  let up = F.sy.xyz; let c = pl.pos.xyz; let R = pl.pos.w;
+  let den = dot(L, up);
+  var rs = 1.0;
+  if (abs(den) > 1e-4) {
+    let tt = dot(c - in.w, up) / den;
+    if (tt > 0.0) { rs = 1.0 - 0.8 * ringDens(length(in.w + L * tt - c) / R, 0.02); }
+  }
+  let mu = max(dot(n, V), 0.0);
+  let haze = pow(1.0 - mu, 3.0) * lit;
+  let col = alb * (lit * rs * 1.3 + 0.008) + vec3f(0.9, 0.72, 0.5) * haze * 0.3;
+  return vec4f(col, 1.0);
+}
+
+// ---------- Планета с океанами ----------
+@fragment fn fs_earth(in: PV) -> @location(0) vec4f {
+  let pl = P[in.id];
+  let n0 = normalize(in.n);
+  let q = toLocal(n0, pl);
+  let t = F.cam.w;
+  let L = normalize(-in.w);
+  let V = normalize(F.cam.xyz - in.w);
+  let h = fbm(q * 1.7 + vec3f(pl.p.z), 6);
+  let land = smoothstep(0.515, 0.53, h);
+  let hl = clamp((h - 0.52) * 5.0, 0.0, 1.0);
+  let hb = hl * pl.pos.w * 0.012;
+  let dpx = dpdx(in.w); let dpy = dpdy(in.w);
+  let n = perturb(n0, dpx, dpy, dpdx(hb), dpdy(hb));
+  let fq = length(fwidth(q)) * 420.0;
+
+  let dry = fbm(q * 5.0 + 7.0, 4);
+  var landc = mix(vec3f(0.05, 0.14, 0.045), vec3f(0.42, 0.33, 0.19), smoothstep(0.45, 0.62, dry));
+  landc = mix(landc, vec3f(0.33, 0.3, 0.28), smoothstep(0.55, 0.9, hl));
+  let ice = smoothstep(0.8, 0.88, abs(q.y) + (dry - 0.5) * 0.18);
+  var alb = mix(mix(vec3f(0.004, 0.025, 0.08), vec3f(0.02, 0.12, 0.19), smoothstep(0.44, 0.515, h)), landc, land);
+  alb = mix(alb, vec3f(0.85, 0.9, 0.95), ice);
+
+  let qc = spinY(q, t * 0.004);
+  let cw = fbm(qc * 3.0 + 2.0, 4);
+  let cl = smoothstep(0.56, 0.8, fbm(qc * vec3f(5.0, 11.0, 5.0) + vec3f(cw * 3.0), 6)) * 0.95;
+
+  let ndl = max(dot(n, L), 0.0);
+  let ndl0 = dot(n0, L);
+  let spec = pow(max(dot(normalize(L + V), n0), 0.0), 90.0) * (1.0 - land) * (1.0 - ice) * (1.0 - cl) * step(0.0, ndl0) * 2.5;
+  var col = alb * ndl * 1.8 + vec3f(1.0, 0.9, 0.75) * spec;
+  let cdiff = smoothstep(-0.05, 0.45, ndl0);
+  col = mix(col, vec3f(0.92) * cdiff * 1.7, cl * 0.9);
+
+  // огни городов на ночной стороне
+  let night = smoothstep(0.05, -0.2, ndl0);
+  let cell = step(0.93, hash13(floor(q * 420.0)));
+  let city = mix(cell, 0.07, smoothstep(0.6, 2.0, fq)) * smoothstep(0.5, 0.68, fbm(q * 13.0, 4)) * land * (1.0 - ice) * (1.0 - cl);
+  col += vec3f(1.0, 0.62, 0.28) * city * night * 1.6;
+
+  // дымка атмосферы по диску
+  let mu = max(dot(n0, V), 0.0);
+  col += vec3f(0.12, 0.3, 0.75) * pow(1.0 - mu, 2.0) * smoothstep(-0.2, 0.5, ndl0) * 0.9;
+  return vec4f(col, 1.0);
+}
+
+// ---------- Луна ----------
+fn craters(p: vec3f) -> f32 {
+  let i = floor(p); let f = fract(p);
+  var h = 0.0;
+  for (var z = -1; z <= 1; z++) {
+    for (var y = -1; y <= 1; y++) {
+      for (var x = -1; x <= 1; x++) {
+        let o = vec3f(f32(x), f32(y), f32(z));
+        let rn = hash33(i + o);
+        let r = 0.12 + 0.32 * rn.x * rn.x;
+        let d = length(o + rn - f) / r;
+        if (d < 1.7) {
+          let bowl = select(0.0, d * d - 1.0, d < 1.0);
+          let rim = exp(-(d - 1.0) * (d - 1.0) * 10.0) * 0.4;
+          h += (bowl + rim) * r;
+        }
+      }
+    }
+  }
+  return h;
+}
+@fragment fn fs_moon(in: PV) -> @location(0) vec4f {
+  let pl = P[in.id];
+  let n0 = normalize(in.n);
+  let q = toLocal(n0, pl);
+  let L = normalize(-in.w);
+  let base = fbm(q * 3.5 + vec3f(pl.p.z), 5);
+  let cr = craters(q * 5.0) * 0.7 + craters(q * 13.0 + 3.0) * 0.35 + craters(q * 31.0 + 9.0) * 0.12;
+  let hgt = (cr + base * 0.3) * pl.pos.w * 0.05;
+  let n = perturb(n0, dpdx(in.w), dpdy(in.w), dpdx(hgt), dpdy(hgt));
+  let maria = smoothstep(0.52, 0.62, fbm(q * 1.4 + 4.0, 4));
+  var alb = mix(vec3f(0.24, 0.235, 0.225), vec3f(0.36, 0.345, 0.33), base);
+  alb = mix(alb, vec3f(0.17, 0.17, 0.18), maria * 0.8);
+  let ndl = max(dot(n, L), 0.0);
+  // лёгкий отражённый свет от планеты
+  let toE = normalize(P[2].pos.xyz - in.w);
+  let es = max(dot(n0, toE), 0.0) * 0.012;
+  let col = alb * (ndl * 1.5 + es);
+  return vec4f(col, 1.0);
+}
+`;
+
+// ---------------------------------------------------------------------
+//  WGSL: атмосферы (аддитивное свечение на краю диска)
+// ---------------------------------------------------------------------
+const ATMO_WGSL = COMMON + /* wgsl */`
+struct Atmo { c: vec4f, col: vec4f, p: vec4f };   // центр+R планеты; цвет+плотность; Ra, яркость
+@group(0) @binding(1) var<storage, read> A: array<Atmo>;
+struct AV { @builtin(position) pos: vec4f, @location(0) w: vec3f, @location(1) @interpolate(flat) id: u32 };
+@vertex fn vs(@location(0) v: vec3f, @builtin(instance_index) id: u32) -> AV {
+  let a = A[id];
+  let w = a.c.xyz + v * a.p.x;
+  var o: AV; o.pos = F.vp * vec4f(w, 1.0); o.w = w; o.id = id; return o;
+}
+@fragment fn fs(in: AV) -> @location(0) vec4f {
+  let a = A[in.id];
+  let ro = F.cam.xyz; let rd = normalize(in.w - ro);
+  let c = a.c.xyz; let R = a.c.w; let Ra = a.p.x;
+  let oc = ro - c; let b = dot(oc, rd);
+  let dA = b * b - (dot(oc, oc) - Ra * Ra);
+  if (dA <= 0.0) { discard; }
+  let s = sqrt(dA);
+  let t0 = max(-b - s, 0.0);
+  var t1 = -b + s;
+  let dP = b * b - (dot(oc, oc) - R * R);
+  if (dP > 0.0) { let tp = -b - sqrt(dP); if (tp > 0.0) { t1 = min(t1, tp); } }
+  let l = max(t1 - t0, 0.0) / (Ra - R);
+  let mid = ro + rd * (t0 + t1) * 0.5;
+  let nm = normalize(mid - c);
+  let L = normalize(-mid);
+  let lit = smoothstep(-0.3, 0.35, dot(nm, L));
+  let dens = 1.0 - exp(-l * a.col.w);
+  let mie = pow(max(dot(rd, L), 0.0), 10.0);
+  let col = a.col.rgb * dens * lit * a.p.y * (1.0 + mie * 2.5);
+  return vec4f(col, 0.0);
+}
+`;
+
+// ---------------------------------------------------------------------
+//  WGSL: кольца газового гиганта
+// ---------------------------------------------------------------------
+const RING_WGSL = COMMON + /* wgsl */`
+struct RV { @builtin(position) pos: vec4f, @location(0) w: vec3f, @location(1) l: vec2f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> RV {
+  var p = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
+  let s = 2.4 * F.giant.w;
+  let l = p[i] * s;
+  let w = F.giant.xyz + F.sx.xyz * l.x + F.sz.xyz * l.y;
+  var o: RV; o.pos = F.vp * vec4f(w, 1.0); o.w = w; o.l = p[i] * 2.4; return o;
+}
+@fragment fn fs(in: RV) -> @location(0) vec4f {
+  let r = length(in.l);
+  let fw = fwidth(r);
+  let d = ringDens(r, fw);
+  if (d < 0.003) { discard; }
+  let L = normalize(-in.w);
+  let V = normalize(F.cam.xyz - in.w);
+  let up = F.sy.xyz;
+  let sunSide = dot(L, up); let camSide = dot(V, up);
+  let sh = giantShadow(in.w, L);
+  var alb = mix(vec3f(0.6, 0.5, 0.38), vec3f(0.88, 0.78, 0.62), vnoise(vec3f(r * 22.0, 3.0, 1.0)));
+  alb = mix(alb, vec3f(0.45, 0.38, 0.32), 1.0 - smoothstep(1.3, 1.7, r));
+  let same = sunSide * camSide > 0.0;
+  let light = select(0.5 * (1.0 - d) + 0.12, 1.0, same) * (0.25 + 0.75 * sqrt(abs(sunSide)));
+  let fwd = pow(max(dot(-V, L), 0.0), 6.0) * (1.0 - d) * 1.5;
+  let col = alb * ((light * 1.6 + fwd) * sh + 0.01);
+  return vec4f(col, min(d * 1.1, 1.0) * 0.96);
+}
+`;
+
+// ---------------------------------------------------------------------
+//  WGSL: корона солнца
+// ---------------------------------------------------------------------
+const CORONA_WGSL = COMMON + /* wgsl */`
+struct CV { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> CV {
+  var p = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
+  let s = SUN_R * 9.0;
+  let w = F.right.xyz * p[i].x * s + F.up.xyz * p[i].y * s;
+  var o: CV; o.pos = F.vp * vec4f(w, 1.0); o.uv = p[i] * 9.0; return o;
+}
+@fragment fn fs(in: CV) -> @location(0) vec4f {
+  let r = length(in.uv);
+  let dir = in.uv / max(r, 1e-4);
+  let t = F.cam.w;
+  let rays = vnoise(vec3f(dir * 5.0, t * 0.03)) * vnoise(vec3f(dir * 13.0 + 5.0, t * 0.05));
+  let x = max(r - 1.0, 0.0);
+  let glow = exp(-x * 2.6) * 1.3 + 0.3 / (1.0 + x * x * 2.5) + rays * exp(-x * 0.9) * 1.1;
+  let fade = 1.0 - smoothstep(5.0, 9.0, r);
+  return vec4f(vec3f(1.0, 0.55, 0.25) * glow * fade, 0.0);
+}
+`;
+
+// ---------------------------------------------------------------------
+//  WGSL: астероиды
+// ---------------------------------------------------------------------
+const AST_WGSL = COMMON + /* wgsl */`
+struct Ast { a: vec4f, b: vec4f, c: vec4f };  // радиус орбиты, фаза, высота, размер | ось, скорость вращения | оттенок, орбит. скорость
+@group(0) @binding(1) var<storage, read> S: array<Ast>;
+struct AV { @builtin(position) pos: vec4f, @location(0) w: vec3f, @location(1) n: vec3f, @location(2) @interpolate(flat) tint: vec4f, @location(3) op: vec3f, @location(4) @interpolate(flat) sc: f32 };
+fn rot(v: vec3f, k: vec3f, a: f32) -> vec3f {
+  let c = cos(a); let s = sin(a);
+  return v * c + cross(k, v) * s + k * dot(k, v) * (1.0 - c);
+}
+@vertex fn vs(@location(0) p: vec3f, @location(1) n: vec3f, @builtin(instance_index) ii: u32) -> AV {
+  let A = S[ii];
+  let t = F.cam.w;
+  let ang = A.a.y + t * A.c.y;
+  let lc = vec3f(cos(ang) * A.a.x, A.a.z, sin(ang) * A.a.x);
+  let center = F.giant.xyz + F.sx.xyz * lc.x + F.sy.xyz * lc.y + F.sz.xyz * lc.z;
+  let sa = t * A.b.w + A.c.z;
+  let w = center + rot(p, A.b.xyz, sa) * A.a.w;
+  var o: AV;
+  o.pos = F.vp * vec4f(w, 1.0); o.w = w; o.n = rot(n, A.b.xyz, sa); o.tint = A.c;
+  o.op = p + vec3f(A.c.z * 3.1); o.sc = A.a.w;
+  return o;
+}
+fn rockH(p: vec3f) -> f32 {
+  return fbm(p * 2.2, 4) * 0.6 + abs(vnoise(p * 7.0) - 0.5) * 0.35;
+}
+@fragment fn fs(in: AV) -> @location(0) vec4f {
+  let n0 = normalize(in.n);
+  let hgt = rockH(in.op);
+  let n = perturb(n0, dpdx(in.w), dpdy(in.w), dpdx(hgt * in.sc * 0.35), dpdy(hgt * in.sc * 0.35));
+  let L = normalize(-in.w);
+  let V = normalize(F.cam.xyz - in.w);
+  let tn = in.tint.x;
+  var alb = mix(vec3f(0.2, 0.185, 0.17), vec3f(0.27, 0.2, 0.15), smoothstep(0.5, 0.9, tn));
+  alb = mix(alb, vec3f(0.18, 0.19, 0.21), smoothstep(0.5, 0.1, tn));
+  alb *= (0.7 + 0.6 * fract(tn * 13.7)) * (0.75 + 0.5 * hgt);
+  let sh = giantShadow(in.w, L);
+  let ndl = max(dot(n, L), 0.0);
+  let toG = normalize(F.giant.xyz - in.w);
+  let bounce = max(dot(n, toG), 0.0) * vec3f(0.06, 0.045, 0.03);
+  let spec = pow(max(dot(normalize(L + V), n), 0.0), 24.0) * 0.12 * step(0.0, dot(n, L));
+  let col = alb * (ndl * 1.8 * sh + bounce + 0.006) + vec3f(spec) * sh;
+  return vec4f(col, 1.0);
+}
+`;
+
+// ---------------------------------------------------------------------
+//  WGSL: станция
+// ---------------------------------------------------------------------
+const STATION_WGSL = COMMON + /* wgsl */`
+struct St { c: vec4f, ax: vec4f, ay: vec4f, az: vec4f, e: vec4f };  // центр+масштаб, оси, планета (центр+R)
+@group(0) @binding(1) var<uniform> S: St;
+struct SV { @builtin(position) pos: vec4f, @location(0) w: vec3f, @location(1) n: vec3f, @location(2) uv: vec2f, @location(3) @interpolate(flat) m: f32 };
+@vertex fn vs(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) uv: vec2f, @location(3) m: f32) -> SV {
+  let w = S.c.xyz + (S.ax.xyz * p.x + S.ay.xyz * p.y + S.az.xyz * p.z) * S.c.w;
+  var o: SV;
+  o.pos = F.vp * vec4f(w, 1.0); o.w = w;
+  o.n = S.ax.xyz * n.x + S.ay.xyz * n.y + S.az.xyz * n.z;
+  o.uv = uv; o.m = m;
+  return o;
+}
+@fragment fn fs(in: SV) -> @location(0) vec4f {
+  let n = normalize(in.n);
+  let L = normalize(-in.w);
+  let V = normalize(F.cam.xyz - in.w);
+  var alb = vec3f(0.55, 0.56, 0.58);
+  var emit = vec3f(0.0);
+  var ks = 0.3; var shin = 30.0;
+  if (in.m < 0.5) {
+    let gu = in.uv * vec2f(180.0, 10.0);
+    let g = fract(gu);
+    alb *= 0.82 + 0.3 * hash13(vec3f(floor(gu), 1.0));
+    let ln = smoothstep(0.0, 0.06, g.x) * smoothstep(1.0, 0.94, g.x) * smoothstep(0.0, 0.1, g.y) * smoothstep(1.0, 0.9, g.y);
+    alb *= 0.6 + 0.4 * ln;
+    let vy = abs(fract(in.uv.y + 0.5) - 0.5);
+    let wc = in.uv.x * 420.0;
+    let win = step(vy, 0.03) * step(0.3, fract(wc)) * step(fract(wc), 0.7) * step(0.3, hash13(vec3f(floor(wc), 7.0, 3.0)));
+    alb = mix(alb, vec3f(0.06), step(vy, 0.042));
+    emit = vec3f(1.0, 0.78, 0.45) * win * 3.5;
+  } else if (in.m < 1.5) {
+    alb = vec3f(0.62, 0.62, 0.64) * (0.85 + 0.15 * step(0.5, fract(in.uv.y * 12.0)));
+  } else {
+    let g = fract(in.uv * vec2f(16.0, 4.0));
+    let ln = smoothstep(0.0, 0.08, g.x) * smoothstep(1.0, 0.92, g.x) * smoothstep(0.0, 0.12, g.y) * smoothstep(1.0, 0.88, g.y);
+    alb = mix(vec3f(0.55, 0.55, 0.6), vec3f(0.02, 0.04, 0.12), ln);
+    ks = 0.9; shin = 140.0;
+  }
+  // тень планеты
+  let oc = S.e.xyz - in.w; let tt = dot(oc, L);
+  var sh = 1.0;
+  if (tt > 0.0) { sh = smoothstep(S.e.w * 0.99, S.e.w * 1.01, length(oc - L * tt)); }
+  let ndl = dot(n, L);
+  let diff = max(ndl, 0.0);
+  let spec = pow(max(dot(normalize(L + V), n), 0.0), shin) * ks * step(0.0, ndl);
+  let toE = normalize(S.e.xyz - in.w);
+  let earthshine = max(dot(n, toE), 0.0) * vec3f(0.03, 0.05, 0.09);
+  // мигающие огни на концах панелей
+  let col = alb * (diff * 1.8 * sh + earthshine + 0.035) + vec3f(spec * 2.0 * sh) + emit;
+  return vec4f(col, 1.0);
+}
+`;
+
+// ---------------------------------------------------------------------
+//  WGSL: космическая пыль вокруг камеры (чувство скорости)
+// ---------------------------------------------------------------------
+const DUST_WGSL = COMMON + /* wgsl */`
+@group(0) @binding(1) var<storage, read> D: array<vec4f>;
+struct DV { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) a: f32 };
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> DV {
+  var cs = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
+  let s = D[ii];
+  let B = 60.0;
+  let cam = F.cam.xyz;
+  let p = cam + (fract((s.xyz * B - cam) / B) - 0.5) * B;
+  let toC = normalize(p - cam);
+  let speed = F.vel.w;
+  var ax = F.up.xyz;
+  var l = 0.03 * s.w;
+  if (speed > 1.0) { ax = F.vel.xyz / speed; l += min(speed * 0.01, 6.0); }
+  var side = cross(ax, toC);
+  if (length(side) < 1e-3) { side = F.right.xyz; }
+  side = normalize(side);
+  let c = cs[vi];
+  let w = p + side * c.x * 0.03 * s.w + ax * c.y * l;
+  let dist = length(p - cam);
+  var o: DV;
+  o.pos = F.vp * vec4f(w, 1.0);
+  o.uv = c;
+  o.a = (1.0 - smoothstep(B * 0.25, B * 0.5, dist)) * smoothstep(0.6, 2.5, dist) * (0.03 * s.w / (0.03 * s.w + l * 0.15));
+  return o;
+}
+@fragment fn fs(in: DV) -> @location(0) vec4f {
+  let f = (1.0 - in.uv.x * in.uv.x) * (1.0 - abs(in.uv.y));
+  return vec4f(vec3f(0.6, 0.66, 0.8) * f * in.a * 0.35, 0.0);
+}
+`;
+
+// ---------------------------------------------------------------------
+//  WGSL: постобработка (свечение и тональная компрессия)
+// ---------------------------------------------------------------------
+const POST_VS = /* wgsl */`
+struct QV { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> QV {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  var o: QV; o.pos = vec4f(p[i], 0.0, 1.0); o.uv = vec2f(p[i].x * 0.5 + 0.5, 0.5 - p[i].y * 0.5); return o;
+}
+`;
+const BRIGHT_WGSL = POST_VS + /* wgsl */`
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@fragment fn fs(in: QV) -> @location(0) vec4f {
+  let c = textureSampleLevel(src, smp, in.uv, 0.0).rgb;
+  let l = max(c.r, max(c.g, c.b));
+  let k = max(l - 1.0, 0.0) / max(l, 1e-4);
+  return vec4f(min(c * k, vec3f(40.0)), 1.0);
+}
+`;
+const BLUR_WGSL = POST_VS + /* wgsl */`
+struct BP { dir: vec4f };
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@group(0) @binding(2) var<uniform> B: BP;
+@fragment fn fs(in: QV) -> @location(0) vec4f {
+  let o1 = B.dir.xy * 1.3846153846; let o2 = B.dir.xy * 3.2307692308;
+  var c = textureSampleLevel(src, smp, in.uv, 0.0) * 0.2270270270;
+  c += (textureSampleLevel(src, smp, in.uv + o1, 0.0) + textureSampleLevel(src, smp, in.uv - o1, 0.0)) * 0.3162162162;
+  c += (textureSampleLevel(src, smp, in.uv + o2, 0.0) + textureSampleLevel(src, smp, in.uv - o2, 0.0)) * 0.0702702703;
+  return c;
+}
+`;
+const COMPOSITE_WGSL = POST_VS + /* wgsl */`
+struct PP { p: vec4f };  // экспозиция, сила свечения, время
+@group(0) @binding(0) var hdr: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@group(0) @binding(2) var b1: texture_2d<f32>;
+@group(0) @binding(3) var b2: texture_2d<f32>;
+@group(0) @binding(4) var b3: texture_2d<f32>;
+@group(0) @binding(5) var<uniform> U: PP;
+fn aces(x: vec3f) -> vec3f {
+  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3f(0.0), vec3f(1.0));
+}
+fn h12(p: vec2f) -> f32 { var q = fract(vec3f(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
+@fragment fn fs(in: QV) -> @location(0) vec4f {
+  var c = textureSampleLevel(hdr, smp, in.uv, 0.0).rgb;
+  let bl = textureSampleLevel(b1, smp, in.uv, 0.0).rgb * 0.5 + textureSampleLevel(b2, smp, in.uv, 0.0).rgb * 0.8 + textureSampleLevel(b3, smp, in.uv, 0.0).rgb * 1.2;
+  c += bl * U.p.y;
+  c = aces(c * U.p.x);
+  let v = in.uv - 0.5;
+  c *= 1.0 - dot(v, v) * 0.5;
+  c = pow(c, vec3f(1.0 / 2.2));
+  c += (h12(in.pos.xy + U.p.z * 61.0) - 0.5) / 255.0;
+  return vec4f(c, 1.0);
+}
+`;
+
+// ---------------------------------------------------------------------
+//  Геометрия
+// ---------------------------------------------------------------------
+// UV-сфера единичного радиуса, треугольники наружу (CCW)
+function makeSphere(seg, ring) {
+  const pos = [];
+  for (let j = 0; j <= ring; j++) {
+    const th = Math.PI * j / ring;
+    for (let i = 0; i <= seg; i++) {
+      const ph = 2 * Math.PI * i / seg;
+      pos.push(Math.sin(th) * Math.cos(ph), Math.cos(th), Math.sin(th) * Math.sin(ph));
+    }
+  }
+  const idx = [];
+  const P = (k) => [pos[k * 3], pos[k * 3 + 1], pos[k * 3 + 2]];
+  const tri = (a, b, c) => {
+    const pa = P(a), pb = P(b), pc = P(c);
+    const nrm = cross(sub(pb, pa), sub(pc, pa));
+    if (len(nrm) < 1e-12) return;
+    if (dot(nrm, add(add(pa, pb), pc)) < 0) idx.push(a, c, b); else idx.push(a, b, c);
+  };
+  for (let j = 0; j < ring; j++) for (let i = 0; i < seg; i++) {
+    const a = j * (seg + 1) + i, b = a + seg + 1;
+    tri(a, b, a + 1); tri(a + 1, b, b + 1);
+  }
+  return { pos: new Float32Array(pos), idx: new Uint32Array(idx) };
+}
+
+// Икосфера с шумовым смещением -> «камень» с плоскими гранями
+function makeRock(seed) {
+  const t = (1 + Math.sqrt(5)) / 2;
+  let verts = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]].map(norm);
+  let faces = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8], [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
+  for (let s = 0; s < 2; s++) {
+    const cache = new Map(), nf = [];
+    const mid = (a, b) => {
+      const k = a < b ? a + "_" + b : b + "_" + a;
+      if (cache.has(k)) return cache.get(k);
+      verts.push(norm(mul(add(verts[a], verts[b]), 0.5)));
+      cache.set(k, verts.length - 1); return verts.length - 1;
+    };
+    for (const [a, b, c] of faces) { const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a); nf.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]); }
+    faces = nf;
+  }
+  const sx = 0.7 + rnd() * 0.5, sy = 0.55 + rnd() * 0.4, sz = 0.8 + rnd() * 0.4;
+  const disp = verts.map((v) => {
+    const k = 1 + 0.38 * (jnoise(v[0] * 1.6 + seed, v[1] * 1.6, v[2] * 1.6) - 0.5) + 0.16 * (jnoise(v[0] * 4 + seed, v[1] * 4 + 3, v[2] * 4) - 0.5);
+    return [v[0] * k * sx, v[1] * k * sy, v[2] * k * sz];
+  });
+  // ориентируем грани наружу и сглаживаем нормали (рельеф дорисует шейдер)
+  const vn = disp.map(() => [0, 0, 0]);
+  for (const f of faces) {
+    const [a, b, c] = f.map((i) => disp[i]);
+    let n = cross(sub(b, a), sub(c, a));
+    if (dot(n, add(add(a, b), c)) < 0) { const tmp = f[1]; f[1] = f[2]; f[2] = tmp; n = mul(n, -1); }
+    for (const i of f) { vn[i] = add(vn[i], n); }
+  }
+  const out = [];
+  for (const f of faces) for (const i of f) {
+    const p = disp[i], n = norm(vn[i]);
+    out.push(p[0], p[1], p[2], n[0], n[1], n[2]);
+  }
+  return new Float32Array(out);
+}
+
+// Станция: тор-кольцо, ступица, спицы, солнечные панели
+function makeStation() {
+  const V = [], I = [];
+  const vert = (p, n, u, v, m) => { V.push(p[0], p[1], p[2], n[0], n[1], n[2], u, v, m); return V.length / 9 - 1; };
+  // тор (кольцо в плоскости XZ, ось Y)
+  const Rt = 12, rt = 1.5, SU = 160, SV = 20;
+  const base = V.length / 9;
+  for (let j = 0; j <= SV; j++) for (let i = 0; i <= SU; i++) {
+    const U = 2 * Math.PI * i / SU, W = 2 * Math.PI * j / SV;
+    const radial = [Math.cos(U), 0, Math.sin(U)];
+    const n = add(mul(radial, Math.cos(W)), [0, Math.sin(W), 0]);
+    vert(add(mul(radial, Rt), mul(n, rt)), n, i / SU, j / SV, 0);
+  }
+  for (let j = 0; j < SV; j++) for (let i = 0; i < SU; i++) {
+    const a = base + j * (SU + 1) + i, b = a + SU + 1;
+    I.push(a, b, a + 1, a + 1, b, b + 1);
+  }
+  // цилиндр между точками a и b
+  const cyl = (a, b, r, seg, m, caps) => {
+    const ax = norm(sub(b, a));
+    const tmp = Math.abs(ax[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+    const u = norm(cross(ax, tmp)), w = cross(ax, u);
+    const s0 = V.length / 9;
+    for (let i = 0; i <= seg; i++) {
+      const t = 2 * Math.PI * i / seg;
+      const n = add(mul(u, Math.cos(t)), mul(w, Math.sin(t)));
+      vert(add(a, mul(n, r)), n, i / seg, 0, m);
+      vert(add(b, mul(n, r)), n, i / seg, 1, m);
+    }
+    for (let i = 0; i < seg; i++) { const k = s0 + i * 2; I.push(k, k + 1, k + 2, k + 2, k + 1, k + 3); }
+    if (caps) for (const [p, nn] of [[a, mul(ax, -1)], [b, ax]]) {
+      const c = vert(p, nn, 0.5, 0.5, m), s1 = V.length / 9;
+      for (let i = 0; i <= seg; i++) { const t = 2 * Math.PI * i / seg; vert(add(p, mul(add(mul(u, Math.cos(t)), mul(w, Math.sin(t))), r)), nn, 0, 0, m); }
+      for (let i = 0; i < seg; i++) I.push(c, s1 + i, s1 + i + 1);
+    }
+  };
+  cyl([0, -5, 0], [0, 5, 0], 2.2, 24, 1, true);
+  cyl([0, -7.5, 0], [0, -5, 0], 0.9, 16, 1, true);
+  cyl([0, 5, 0], [0, 7.5, 0], 0.9, 16, 1, true);
+  for (let k = 0; k < 4; k++) {
+    const a = k * Math.PI / 2, d = [Math.cos(a), 0, Math.sin(a)];
+    cyl(mul(d, 2.1), mul(d, Rt - rt + 0.2), 0.45, 12, 1, false);
+  }
+  // солнечные панели: штанги и пластины
+  const box = (c, h, m) => {
+    const faces = [[[1, 0, 0], [0, 1, 0], [0, 0, 1]], [[-1, 0, 0], [0, 0, 1], [0, 1, 0]], [[0, 1, 0], [0, 0, 1], [1, 0, 0]], [[0, -1, 0], [1, 0, 0], [0, 0, 1]], [[0, 0, 1], [1, 0, 0], [0, 1, 0]], [[0, 0, -1], [0, 1, 0], [1, 0, 0]]];
+    for (const [n, u, v] of faces) {
+      const o = add(c, [n[0] * h[0], n[1] * h[1], n[2] * h[2]]);
+      const U = [u[0] * h[0], u[1] * h[1], u[2] * h[2]], W = [v[0] * h[0], v[1] * h[1], v[2] * h[2]];
+      const s0 = V.length / 9;
+      vert(sub(sub(o, U), W), n, 0, 0, m); vert(sub(add(o, U), W), n, 1, 0, m);
+      vert(add(add(o, U), W), n, 1, 1, m); vert(add(sub(o, U), W), n, 0, 1, m);
+      I.push(s0, s0 + 1, s0 + 2, s0, s0 + 2, s0 + 3);
+    }
+  };
+  for (const y of [-6.2, 6.2]) {
+    cyl([-9.5, y, 0], [9.5, y, 0], 0.15, 8, 1, false);
+    for (const sx of [-1, 1]) box([sx * 6.2, y, 0], [3.2, 0.05, 1.8], 2);
+  }
+  return { v: new Float32Array(V), i: new Uint32Array(I) };
+}
+
+// ---------------------------------------------------------------------
+//  Точки обзора
+// ---------------------------------------------------------------------
+const VIEWS = (() => {
+  const sunL = norm(mul(GIANT, -1));
+  const sl = [dot(sunL, SYS.x), dot(sunL, SYS.y), dot(sunL, SYS.z)];
+  const a0 = Math.atan2(sl[2], sl[0]) + 1.15;
+  const v1 = sysToWorld([Math.cos(a0) * 760, 85, Math.sin(a0) * 760]);
+  const a2 = Math.atan2(sl[2], sl[0]) + 0.5;
+  const v2 = sysToWorld([Math.cos(a2) * 520, 330, Math.sin(a2) * 520]);
+  const sOut = norm(sub(STATION, EARTH));
+  const side = norm(cross(sOut, [0, 1, 0]));
+  const v3p = add(add(STATION, mul(sOut, 38)), add(mul(side, 22), [0, 9, 0]));
+  const mOut = norm(sub(MOON, EARTH));
+  const v4p = add(add(MOON, mul(mOut, 55)), add([0, 22, 0], mul(norm(cross(mOut, [0, 1, 0])), 25)));
+  return [
+    { p: v1, t: GIANT },
+    { p: v2, t: add(GIANT, mul(SYS.y, -60)) },
+    { p: v3p, t: add(STATION, mul(sub(EARTH, STATION), 0.25)) },
+    { p: v4p, t: add(MOON, mul(sub(EARTH, MOON), 0.4)) },
+    { p: [760, 260, 560], t: [0, 0, 0] },
+    { p: [-900, 2300, 3900], t: [300, 0, 0] },
+  ];
+})();
+
+// ---------------------------------------------------------------------
+//  Камера и ввод
+// ---------------------------------------------------------------------
+const cam = { p: [0, 0, 0], yaw: 0, pitch: 0, vel: [0, 0, 0], boost: 0 };
+function lookAt(view) {
+  cam.p = view.p.slice();
+  const d = norm(sub(view.t, view.p));
+  cam.yaw = Math.atan2(d[0], -d[2]);
+  cam.pitch = Math.asin(Math.max(-1, Math.min(1, d[1])));
+  cam.vel = [0, 0, 0];
+}
+lookAt(VIEWS[0]);
+
+const keys = Object.create(null);
+let running = false, mouseDown = false, statsOn = false, soundOn = true;
+addEventListener("keydown", (e) => {
+  keys[e.code] = true;
+  if (!running) return;
+  if (e.code >= "Digit1" && e.code <= "Digit6") lookAt(VIEWS[+e.code.slice(5) - 1]);
+  if (e.code === "KeyH") { statsOn = !statsOn; $("stats").style.display = statsOn ? "block" : "none"; }
+  if (e.code === "KeyM") toggleSound();
+  if (e.code === "Escape") openMenu();
+});
+addEventListener("keyup", (e) => { keys[e.code] = false; });
+addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
+canvas.addEventListener("mousedown", () => { mouseDown = true; });
+addEventListener("mouseup", () => { mouseDown = false; });
+addEventListener("mousemove", (e) => {
+  if (!running) return;
+  if (document.pointerLockElement === canvas || mouseDown) {
+    cam.yaw += e.movementX * 0.0022;
+    cam.pitch = Math.max(-1.55, Math.min(1.55, cam.pitch - e.movementY * 0.0022));
+  }
+});
+document.addEventListener("pointerlockchange", () => {
+  if (document.pointerLockElement !== canvas && running && lockedOnce) openMenu();
+});
+let lockedOnce = false;
+function openMenu() {
+  running = false;
+  $("menu").classList.remove("hidden");
+  $("go").textContent = "Продолжить";
+  if (document.pointerLockElement) document.exitPointerLock();
+}
+function startFlight() {
+  $("menu").classList.add("hidden");
+  running = true;
+  try {
+    const r = canvas.requestPointerLock();
+    lockedOnce = true;
+    if (r && r.catch) r.catch(() => { lockedOnce = false; });
+  } catch (e) { lockedOnce = false; }
+  canvas.focus();
+  startAudio();
+  setTimeout(() => { $("hint").style.opacity = 0; }, 6000);
+}
+$("go").addEventListener("click", startFlight);
+for (const b of document.querySelectorAll(".q")) {
+  if (b.dataset.q === qName) b.classList.add("on");
+  b.addEventListener("click", () => {
+    if (b.dataset.q === qName) return;
+    try { localStorage.setItem("stellar-quality", b.dataset.q); } catch (e) {}
+    location.reload();
+  });
+}
+
+// ---------------------------------------------------------------------
+//  Звук: живой синтез через Web Audio
+// ---------------------------------------------------------------------
+let actx = null, master = null;
+function startAudio() {
+  if (actx) { if (actx.state === "suspended") actx.resume(); return; }
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    master = actx.createGain(); master.gain.value = soundOn ? 0.5 : 0; master.connect(actx.destination);
+    const lp = actx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 380; lp.Q.value = 0.7; lp.connect(master);
+    const lfo = actx.createOscillator(); lfo.frequency.value = 0.05;
+    const lfoG = actx.createGain(); lfoG.gain.value = 160; lfo.connect(lfoG); lfoG.connect(lp.frequency); lfo.start();
+    for (const [f, g] of [[55, 0.09], [82.6, 0.06], [110.4, 0.045], [164.6, 0.02]]) {
+      const o = actx.createOscillator(); o.type = "sawtooth"; o.frequency.value = f;
+      o.detune.value = (rnd() - 0.5) * 14;
+      const gg = actx.createGain(); gg.gain.value = g; o.connect(gg); gg.connect(lp); o.start();
+    }
+    // мягкий «солнечный ветер» из коричневого шума
+    const nb = actx.createBuffer(1, actx.sampleRate * 4, actx.sampleRate), ch = nb.getChannelData(0);
+    let last = 0; for (let i = 0; i < ch.length; i++) { last = (last + 0.02 * (Math.random() * 2 - 1)) / 1.02; ch[i] = last * 3.5; }
+    const ns = actx.createBufferSource(); ns.buffer = nb; ns.loop = true;
+    const bp = actx.createBiquadFilter(); bp.type = "bandpass"; bp.frequency.value = 500; bp.Q.value = 0.6;
+    const ng = actx.createGain(); ng.gain.value = 0.25; ns.connect(bp); bp.connect(ng); ng.connect(master); ns.start();
+    // редкие звоны с эхом
+    const dl = actx.createDelay(2); dl.delayTime.value = 0.6;
+    const fb = actx.createGain(); fb.gain.value = 0.45; dl.connect(fb); fb.connect(dl);
+    const wet = actx.createGain(); wet.gain.value = 0.6; dl.connect(wet); wet.connect(master);
+    const notes = [523.25, 587.33, 659.25, 783.99, 880, 1046.5];
+    const chime = () => {
+      const t0 = actx.currentTime;
+      const o = actx.createOscillator(); o.type = "sine"; o.frequency.value = notes[(Math.random() * notes.length) | 0];
+      const g = actx.createGain(); g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(0.05, t0 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 3);
+      o.connect(g); g.connect(master); g.connect(dl); o.start(t0); o.stop(t0 + 3.1);
+      setTimeout(chime, 3500 + Math.random() * 6000);
+    };
+    setTimeout(chime, 2500);
+  } catch (e) { actx = null; }
+}
+function toggleSound() {
+  soundOn = !soundOn;
+  if (master) master.gain.setTargetAtTime(soundOn ? 0.5 : 0, actx.currentTime, 0.1);
+}
+
+// ---------------------------------------------------------------------
+//  WebGPU
+// ---------------------------------------------------------------------
+async function main() {
+  if (!navigator.gpu) { fail("Для этой сцены нужен WebGPU", "Открой страницу в свежем Chrome или Edge на компьютере."); return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) { fail("Не удалось получить видеокарту через WebGPU"); return; }
+  const device = await adapter.requestDevice();
+  device.addEventListener("uncapturederror", (e) => console.error("WebGPU:", e.error.message));
+  device.lost.then((info) => { console.error("device lost:", info.reason, info.message); if (info.reason !== "destroyed") fail("Видеодрайвер сбросил устройство", info.message); });
+
+  const ctx = canvas.getContext("webgpu");
+  const fmt = navigator.gpu.getPreferredCanvasFormat();
+  // ?offscreen — рендер в текстуру вместо холста (для автоматических скриншотов без дисплея)
+  const OFF = /[?&]offscreen/.test(location.search);
+  if (!OFF) ctx.configure({ device, format: fmt, alphaMode: "opaque", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  const HDR = "rgba16float";
+  const MS = Q.msaa;
+
+  async function module(code, label) {
+    const m = device.createShaderModule({ code, label });
+    const info = await m.getCompilationInfo();
+    const errs = info.messages.filter((x) => x.type === "error");
+    if (errs.length) {
+      const txt = errs.map((x) => label + ":" + x.lineNum + ":" + x.linePos + " " + x.message).join("\n");
+      console.error(txt); fail("Ошибка шейдера", txt); throw new Error(txt);
+    }
+    return m;
+  }
+  const [mSky, mPlanet, mAtmo, mRing, mCorona, mAst, mStation, mDust, mBright, mBlur, mComp] = await Promise.all([
+    module(SKY_WGSL, "sky"), module(PLANET_WGSL, "planet"), module(ATMO_WGSL, "atmo"), module(RING_WGSL, "ring"),
+    module(CORONA_WGSL, "corona"), module(AST_WGSL, "asteroids"), module(STATION_WGSL, "station"), module(DUST_WGSL, "dust"),
+    module(BRIGHT_WGSL, "bright"), module(BLUR_WGSL, "blur"), module(COMPOSITE_WGSL, "composite")]);
+
+  // ----- буферы -----
+  const buf = (data, usage) => {
+    const b = device.createBuffer({ size: Math.max(16, (data.byteLength + 3) & ~3), usage: usage | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(b, 0, data); return b;
+  };
+  const frameData = new Float32Array(52);
+  const frameBuf = device.createBuffer({ size: frameData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  const sph = makeSphere(Q.sphere[0], Q.sphere[1]);
+  const sphV = buf(sph.pos, GPUBufferUsage.VERTEX), sphI = buf(sph.idx, GPUBufferUsage.INDEX);
+
+  const planetData = new Float32Array([
+    0, 0, 0, SUN_R, 0.002, 0.1, 0, 0,
+    GIANT[0], GIANT[1], GIANT[2], GIANT_R, 0.004, 0, 3.7, 0,
+    EARTH[0], EARTH[1], EARTH[2], EARTH_R, 0.003, 0.41, 12.3, 0,
+    MOON[0], MOON[1], MOON[2], MOON_R, 0.0006, 0.1, 5.1, 0,
+  ]);
+  const planetBuf = buf(planetData, GPUBufferUsage.STORAGE);
+  const atmoData = new Float32Array([
+    EARTH[0], EARTH[1], EARTH[2], EARTH_R, 0.25, 0.55, 1.35, 0.16, EARTH_R * 1.06, 1.6, 0, 0,
+    GIANT[0], GIANT[1], GIANT[2], GIANT_R, 1.0, 0.78, 0.52, 0.1, GIANT_R * 1.035, 0.9, 0, 0,
+  ]);
+  const atmoBuf = buf(atmoData, GPUBufferUsage.STORAGE);
+
+  // астероиды: 4 формы, у каждой свой блок экземпляров
+  const ROCKS = 4, maxPer = Math.ceil(QUALITY.high.ast / ROCKS), curPer = Math.ceil(Q.ast / ROCKS);
+  const rockMeshes = [];
+  for (let k = 0; k < ROCKS; k++) rockMeshes.push(makeRock(k * 17.3 + 4.1));
+  const rockVerts = rockMeshes[0].length / 6;
+  const allRocks = new Float32Array(rockMeshes.reduce((s, m) => s + m.length, 0));
+  { let o = 0; for (const m of rockMeshes) { allRocks.set(m, o); o += m.length; } }
+  const rockBuf = buf(allRocks, GPUBufferUsage.VERTEX);
+  const astData = new Float32Array(maxPer * ROCKS * 12);
+  for (let i = 0; i < maxPer * ROCKS; i++) {
+    const r = Math.max(540, Math.min(930, 730 + gauss() * 95));
+    let s = 0.35 + 6.5 * Math.pow(rnd(), 6);
+    if (rnd() < 0.004) s = 8 + rnd() * 8;
+    const ax = norm([gauss(), gauss(), gauss()]);
+    const o = i * 12;
+    astData.set([r, rnd() * Math.PI * 2, gauss() * 7 * (0.6 + rnd()), s,
+      ax[0], ax[1], ax[2], (rnd() - 0.5) * 0.8,
+      rnd(), 0.0035 * Math.pow(730 / r, 1.5), rnd() * 6.28, 0], o);
+  }
+  const astBuf = buf(astData, GPUBufferUsage.STORAGE);
+
+  const st = makeStation();
+  const stV = buf(st.v, GPUBufferUsage.VERTEX), stI = buf(st.i, GPUBufferUsage.INDEX);
+  const stData = new Float32Array(20);
+  const stBuf = device.createBuffer({ size: stData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  const dustData = new Float32Array(QUALITY.high.dust * 4);
+  for (let i = 0; i < dustData.length; i += 4) dustData.set([rnd(), rnd(), rnd(), 0.5 + rnd() * 1.5], i);
+  const dustBuf = buf(dustData, GPUBufferUsage.STORAGE);
+
+  // ----- конвейеры -----
+  const depthOpaque = { format: "depth32float", depthWriteEnabled: true, depthCompare: "greater" };
+  const depthRead = { format: "depth32float", depthWriteEnabled: false, depthCompare: "greater" };
+  const additive = { color: { srcFactor: "one", dstFactor: "one", operation: "add" }, alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" } };
+  const alphaBlend = { color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" }, alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" } };
+  const sphereLayout = [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }] }];
+  const scenePipe = (m, fsName, opt) => device.createRenderPipelineAsync({
+    layout: "auto",
+    vertex: { module: m, entryPoint: "vs", buffers: opt.buffers || [] },
+    fragment: { module: m, entryPoint: fsName, targets: [{ format: HDR, blend: opt.blend }] },
+    primitive: { topology: "triangle-list", cullMode: opt.cull || "none" },
+    depthStencil: opt.depth,
+    multisample: { count: MS },
+  });
+  const postPipe = (m, format) => device.createRenderPipelineAsync({
+    layout: "auto", vertex: { module: m, entryPoint: "vs" },
+    fragment: { module: m, entryPoint: "fs", targets: [{ format }] }, primitive: { topology: "triangle-list" },
+  });
+  const [pSky, pSun, pGiant, pEarth, pMoon, pAtmo, pRing, pCorona, pAst, pStation, pDust, pBright, pBlur, pComp] = await Promise.all([
+    scenePipe(mSky, "fs", { depth: { format: "depth32float", depthWriteEnabled: false, depthCompare: "always" } }),
+    scenePipe(mPlanet, "fs_sun", { buffers: sphereLayout, depth: depthOpaque, cull: "back" }),
+    scenePipe(mPlanet, "fs_giant", { buffers: sphereLayout, depth: depthOpaque, cull: "back" }),
+    scenePipe(mPlanet, "fs_earth", { buffers: sphereLayout, depth: depthOpaque, cull: "back" }),
+    scenePipe(mPlanet, "fs_moon", { buffers: sphereLayout, depth: depthOpaque, cull: "back" }),
+    scenePipe(mAtmo, "fs", { buffers: sphereLayout, depth: depthRead, cull: "front", blend: additive }),
+    scenePipe(mRing, "fs", { depth: depthRead, blend: alphaBlend }),
+    scenePipe(mCorona, "fs", { depth: depthRead, blend: additive }),
+    scenePipe(mAst, "fs", { buffers: [{ arrayStride: 24, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }, { shaderLocation: 1, offset: 12, format: "float32x3" }] }], depth: depthOpaque, cull: "back" }),
+    scenePipe(mStation, "fs", { buffers: [{ arrayStride: 36, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }, { shaderLocation: 1, offset: 12, format: "float32x3" }, { shaderLocation: 2, offset: 24, format: "float32x2" }, { shaderLocation: 3, offset: 32, format: "float32" }] }], depth: depthOpaque }),
+    scenePipe(mDust, "fs", { depth: depthRead, blend: additive }),
+    postPipe(mBright, HDR), postPipe(mBlur, HDR), postPipe(mComp, fmt),
+  ]);
+
+  const bg = (pipe, entries) => device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: entries.map((r, i) => ({ binding: i, resource: r })) });
+  const F = { buffer: frameBuf };
+  const bgSky = bg(pSky, [F]);
+  const bgSun = bg(pSun, [F, { buffer: planetBuf }]), bgGiant = bg(pGiant, [F, { buffer: planetBuf }]);
+  const bgEarth = bg(pEarth, [F, { buffer: planetBuf }]), bgMoon = bg(pMoon, [F, { buffer: planetBuf }]);
+  const bgAtmo = bg(pAtmo, [F, { buffer: atmoBuf }]);
+  const bgRing = bg(pRing, [F]), bgCorona = bg(pCorona, [F]);
+  const bgAst = bg(pAst, [F, { buffer: astBuf }]);
+  const bgStation = bg(pStation, [F, { buffer: stBuf }]);
+  const bgDust = bg(pDust, [F, { buffer: dustBuf }]);
+
+  // ----- текстуры под размер экрана -----
+  const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge" });
+  const blurU = []; for (let i = 0; i < 6; i++) blurU.push(device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
+  const postData = new Float32Array(4);
+  const postBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  let T = null; let W = 0, H = 0;
+  let resScale = Q.scale;
+  const tex = (w, h, format, sc) => device.createTexture({ size: [w, h], format, sampleCount: sc || 1, usage: GPUTextureUsage.RENDER_ATTACHMENT | ((sc || 1) === 1 ? GPUTextureUsage.TEXTURE_BINDING : 0) });
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(64, Math.floor(innerWidth * dpr * resScale)), h = Math.max(64, Math.floor(innerHeight * dpr * resScale));
+    if (T && w === W && h === H) return;
+    if (T) for (const k in T) if (T[k] && T[k].destroy) T[k].destroy();
+    W = w; H = h; canvas.width = w; canvas.height = h;
+    const hw = Math.max(1, w >> 1), hh = Math.max(1, h >> 1), qw = Math.max(1, w >> 2), qh = Math.max(1, h >> 2), ew = Math.max(1, w >> 3), eh = Math.max(1, h >> 3);
+    T = {
+      hdr: tex(w, h, HDR), msColor: MS > 1 ? tex(w, h, HDR, MS) : null, depth: tex(w, h, "depth32float", MS),
+      off: OFF ? device.createTexture({ size: [w, h], format: fmt, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC }) : null,
+      h1: tex(hw, hh, HDR), h2: tex(hw, hh, HDR), q1: tex(qw, qh, HDR), q2: tex(qw, qh, HDR), e1: tex(ew, eh, HDR), e2: tex(ew, eh, HDR),
+    };
+    const dirs = [[1.5 / hw, 0], [0, 1.5 / hh], [1.5 / hw, 0], [0, 1.5 / qh], [1.5 / qw, 0], [0, 1.5 / eh]];
+    dirs.forEach((d, i) => device.queue.writeBuffer(blurU[i], 0, new Float32Array([d[0], d[1], 0, 0])));
+    const v = (t) => t.createView();
+    T.bgBright = bg(pBright, [v(T.hdr), sampler]);
+    T.blurs = [
+      [bg(pBlur, [v(T.h1), sampler, { buffer: blurU[0] }]), v(T.h2)],
+      [bg(pBlur, [v(T.h2), sampler, { buffer: blurU[1] }]), v(T.h1)],
+      [bg(pBlur, [v(T.h1), sampler, { buffer: blurU[2] }]), v(T.q2)],
+      [bg(pBlur, [v(T.q2), sampler, { buffer: blurU[3] }]), v(T.q1)],
+      [bg(pBlur, [v(T.q1), sampler, { buffer: blurU[4] }]), v(T.e2)],
+      [bg(pBlur, [v(T.e2), sampler, { buffer: blurU[5] }]), v(T.e1)],
+    ];
+    T.bgComp = bg(pComp, [v(T.hdr), sampler, v(T.h1), v(T.q1), v(T.e1), { buffer: postBuf }]);
+    T.vScene = v(MS > 1 ? T.msColor : T.hdr); T.vHdr = v(T.hdr); T.vDepth = v(T.depth); T.vH1 = v(T.h1);
+  }
+  resize();
+  addEventListener("resize", () => resize());
+
+  // заранее собранные описания проходов (меняем только view)
+  const sceneColor = { view: null, resolveTarget: undefined, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: MS > 1 ? "discard" : "store" };
+  const sceneDesc = { colorAttachments: [sceneColor], depthStencilAttachment: { view: null, depthClearValue: 0, depthLoadOp: "clear", depthStoreOp: "discard" } };
+  const postColor = { view: null, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } };
+  const postDesc = { colorAttachments: [postColor] };
+
+  // ----- состояние кадра -----
+  const fwd = [0, 0, 1], right = [1, 0, 0], up = [0, 1, 0];
+  const fov = 70 * Math.PI / 180, near = 0.3;
+  let t0 = performance.now(), last = t0, ftAvg = 16, frames = 0, fpsT = t0, fps = 0, adaptT = t0;
+  const colliders = [[0, 0, 0, SUN_R * 1.25], [GIANT[0], GIANT[1], GIANT[2], GIANT_R * 1.05], [EARTH[0], EARTH[1], EARTH[2], EARTH_R * 1.08], [MOON[0], MOON[1], MOON[2], MOON_R * 1.04]];
+
+  let gpuBusy = false;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (OFF && gpuBusy) return;
+    const dt = Math.min((now - last) / 1000, 0.1);
+    ftAvg += ((now - last) - ftAvg) * 0.05;
+    last = now;
+    const time = (now - t0) / 1000 + 120;
+
+    // камера
+    const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch), cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+    fwd[0] = sy * cp; fwd[1] = sp; fwd[2] = -cy * cp;
+    right[0] = cy; right[1] = 0; right[2] = sy;
+    up[0] = right[1] * fwd[2] - right[2] * fwd[1]; up[1] = right[2] * fwd[0] - right[0] * fwd[2]; up[2] = right[0] * fwd[1] - right[1] * fwd[0];
+    if (running) {
+      const mz = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0), mx = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0), my = (keys.KeyE ? 1 : 0) - (keys.KeyQ ? 1 : 0);
+      cam.boost = (keys.ShiftLeft || keys.ShiftRight) ? Math.min(cam.boost + dt * 0.45, 1) : 0;
+      const speed = 22 + 1400 * cam.boost * cam.boost;
+      let tx = fwd[0] * mz + right[0] * mx, ty = fwd[1] * mz + my, tz = fwd[2] * mz + right[2] * mx;
+      const tl = Math.hypot(tx, ty, tz) || 1;
+      const k = 1 - Math.exp(-dt * 4);
+      cam.vel[0] += (tx / tl * speed * (mx || my || mz ? 1 : 0) - cam.vel[0]) * k;
+      cam.vel[1] += (ty / tl * speed * (mx || my || mz ? 1 : 0) - cam.vel[1]) * k;
+      cam.vel[2] += (tz / tl * speed * (mx || my || mz ? 1 : 0) - cam.vel[2]) * k;
+    } else { cam.vel[0] *= 0.9; cam.vel[1] *= 0.9; cam.vel[2] *= 0.9; }
+    cam.p[0] += cam.vel[0] * dt; cam.p[1] += cam.vel[1] * dt; cam.p[2] += cam.vel[2] * dt;
+    for (const c of colliders) {
+      const dx = cam.p[0] - c[0], dy = cam.p[1] - c[1], dz = cam.p[2] - c[2], d = Math.hypot(dx, dy, dz);
+      if (d < c[3]) { const s = c[3] / d; cam.p[0] = c[0] + dx * s; cam.p[1] = c[1] + dy * s; cam.p[2] = c[2] + dz * s; }
+    }
+    const lim = 9000, dist = Math.hypot(cam.p[0], cam.p[1], cam.p[2]);
+    if (dist > lim) { cam.p[0] *= lim / dist; cam.p[1] *= lim / dist; cam.p[2] *= lim / dist; }
+
+    // матрица вида-проекции (обратная Z, бесконечная дальняя плоскость)
+    const aspect = W / H, f = 1 / Math.tan(fov / 2);
+    const m = frameData, c = cam.p;
+    const dr = -(right[0] * c[0] + right[1] * c[1] + right[2] * c[2]);
+    const du = -(up[0] * c[0] + up[1] * c[1] + up[2] * c[2]);
+    const df = -(fwd[0] * c[0] + fwd[1] * c[1] + fwd[2] * c[2]);
+    const fa = f / aspect;
+    m[0] = fa * right[0]; m[1] = f * up[0]; m[2] = 0; m[3] = fwd[0];
+    m[4] = fa * right[1]; m[5] = f * up[1]; m[6] = 0; m[7] = fwd[1];
+    m[8] = fa * right[2]; m[9] = f * up[2]; m[10] = 0; m[11] = fwd[2];
+    m[12] = fa * dr; m[13] = f * du; m[14] = near; m[15] = df;
+    m[16] = c[0]; m[17] = c[1]; m[18] = c[2]; m[19] = time;
+    m[20] = fwd[0]; m[21] = fwd[1]; m[22] = fwd[2]; m[23] = Math.tan(fov / 2);
+    m[24] = right[0]; m[25] = right[1]; m[26] = right[2]; m[27] = aspect;
+    m[28] = up[0]; m[29] = up[1]; m[30] = up[2]; m[31] = 2 * Math.tan(fov / 2) / H;
+    m[32] = SYS.x[0]; m[33] = SYS.x[1]; m[34] = SYS.x[2];
+    m[36] = SYS.y[0]; m[37] = SYS.y[1]; m[38] = SYS.y[2];
+    m[40] = SYS.z[0]; m[41] = SYS.z[1]; m[42] = SYS.z[2];
+    m[44] = GIANT[0]; m[45] = GIANT[1]; m[46] = GIANT[2]; m[47] = GIANT_R;
+    m[48] = cam.vel[0]; m[49] = cam.vel[1]; m[50] = cam.vel[2]; m[51] = Math.hypot(cam.vel[0], cam.vel[1], cam.vel[2]);
+    device.queue.writeBuffer(frameBuf, 0, frameData);
+
+    // станция медленно вращается вокруг своей оси
+    const sa = time * 0.05, ca = Math.cos(sa), sn = Math.sin(sa);
+    const tilt = 0.35;
+    stData[0] = STATION[0]; stData[1] = STATION[1]; stData[2] = STATION[2]; stData[3] = STATION_SCALE;
+    const ct = Math.cos(tilt), stt = Math.sin(tilt);
+    stData[4] = ca; stData[5] = stt * sn; stData[6] = -ct * sn; stData[7] = 0;
+    stData[8] = 0; stData[9] = ct; stData[10] = stt; stData[11] = 0;
+    stData[12] = sn; stData[13] = -stt * ca; stData[14] = ct * ca; stData[15] = 0;
+    stData[16] = EARTH[0]; stData[17] = EARTH[1]; stData[18] = EARTH[2]; stData[19] = EARTH_R;
+    device.queue.writeBuffer(stBuf, 0, stData);
+
+    postData[0] = 0.9; postData[1] = 0.035; postData[2] = time % 100; postData[3] = 0;
+    device.queue.writeBuffer(postBuf, 0, postData);
+
+    // проходы
+    const enc = device.createCommandEncoder();
+    sceneColor.view = T.vScene; sceneColor.resolveTarget = MS > 1 ? T.vHdr : undefined;
+    sceneDesc.depthStencilAttachment.view = T.vDepth;
+    const p = enc.beginRenderPass(sceneDesc); 
+    p.setPipeline(pSky); p.setBindGroup(0, bgSky); p.draw(3);
+    p.setVertexBuffer(0, sphV); p.setIndexBuffer(sphI, "uint32");
+    p.setPipeline(pSun); p.setBindGroup(0, bgSun); p.drawIndexed(sph.idx.length, 1, 0, 0, 0);
+    p.setPipeline(pGiant); p.setBindGroup(0, bgGiant); p.drawIndexed(sph.idx.length, 1, 0, 0, 1);
+    p.setPipeline(pEarth); p.setBindGroup(0, bgEarth); p.drawIndexed(sph.idx.length, 1, 0, 0, 2);
+    p.setPipeline(pMoon); p.setBindGroup(0, bgMoon); p.drawIndexed(sph.idx.length, 1, 0, 0, 3);
+    p.setPipeline(pAst); p.setBindGroup(0, bgAst); p.setVertexBuffer(0, rockBuf);
+    for (let k = 0; k < ROCKS; k++) p.draw(rockVerts, curPer, k * rockVerts, k * maxPer);
+    p.setPipeline(pStation); p.setBindGroup(0, bgStation); p.setVertexBuffer(0, stV); p.setIndexBuffer(stI, "uint32"); p.drawIndexed(st.i.length);
+    p.setPipeline(pAtmo); p.setBindGroup(0, bgAtmo); p.setVertexBuffer(0, sphV); p.setIndexBuffer(sphI, "uint32"); p.drawIndexed(sph.idx.length, 2);
+    p.setPipeline(pRing); p.setBindGroup(0, bgRing); p.draw(6);
+    p.setPipeline(pCorona); p.setBindGroup(0, bgCorona); p.draw(6);
+    p.setPipeline(pDust); p.setBindGroup(0, bgDust); p.draw(6, Math.min(Q.dust, QUALITY.high.dust));
+    p.end();
+
+    const post = (pipe, group, view) => { postColor.view = view; const q = enc.beginRenderPass(postDesc); q.setPipeline(pipe); q.setBindGroup(0, group); q.draw(3); q.end(); };
+    post(pBright, T.bgBright, T.vH1);
+    for (const [g, v] of T.blurs) post(pBlur, g, v);
+    const cur = OFF ? T.off : ctx.getCurrentTexture();
+    post(pComp, T.bgComp, cur.createView());
+    let grab = null;
+    if (window.__grab) { window.__grab = false; grab = debugGrab(enc, cur); }
+    device.queue.submit([enc.finish()]);
+    if (OFF) { gpuBusy = true; device.queue.onSubmittedWorkDone().then(() => { gpuBusy = false; }); }
+    if (grab) grab();
+
+    // статистика и динамическое разрешение
+    frames++;
+    if (now - fpsT > 500) { fps = frames * 1000 / (now - fpsT); frames = 0; fpsT = now; if (statsOn) $("stats").textContent = `FPS  ${fps.toFixed(0)}\nкадр ${ftAvg.toFixed(1)} мс\nразр ${W}×${H} (${(resScale * 100).toFixed(0)}%)\nдет. ${qName}\nскор ${Math.hypot(...cam.vel).toFixed(0)}`; }
+    if (running && now - adaptT > 2000) {
+      adaptT = now;
+      if (ftAvg > 19 && resScale > 0.45) { resScale = Math.max(0.45, resScale - 0.1); resize(); }
+      else if (ftAvg < 12 && resScale < Q.scale) { resScale = Math.min(Q.scale, resScale + 0.05); resize(); }
+    }
+    window.__frames = (window.__frames || 0) + 1;
+  }
+  // отладка: снимок кадра (используется только для автоматических скриншотов)
+  function debugGrab(enc, cur) {
+    const w = cur.width, h = cur.height, bpr = Math.ceil(w * 4 / 256) * 256;
+    const gb = device.createBuffer({ size: bpr * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyTextureToBuffer({ texture: cur }, { buffer: gb, bytesPerRow: bpr }, [w, h]);
+    return () => gb.mapAsync(GPUMapMode.READ).then(() => {
+      const src = new Uint8Array(gb.getMappedRange()), c2 = document.createElement("canvas");
+      c2.width = w; c2.height = h;
+      const g = c2.getContext("2d"), img = g.createImageData(w, h), bgra = fmt.startsWith("bgra");
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const s = y * bpr + x * 4, d = (y * w + x) * 4;
+        img.data[d] = src[s + (bgra ? 2 : 0)]; img.data[d + 1] = src[s + 1]; img.data[d + 2] = src[s + (bgra ? 0 : 2)]; img.data[d + 3] = 255;
+      }
+      g.putImageData(img, 0, 0); window.__img = c2.toDataURL("image/png"); gb.destroy();
+    });
+  }
+  requestAnimationFrame(frame);
+
+  $("go").disabled = false; $("go").textContent = "Полетели";
+  // для скриншотов: #view1 … #view6 — сразу показать точку обзора без меню
+  const hm = /^#view([1-6])$/.exec(location.hash);
+  if (hm) { lookAt(VIEWS[+hm[1] - 1]); $("menu").classList.add("hidden"); $("hint").style.display = "none"; }
+}
+main().catch((e) => { console.error(e); if ($("err").style.display !== "flex") fail("Не удалось запустить сцену", e && e.message); });
+</script>
+</body>
+</html>
